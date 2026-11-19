@@ -58,6 +58,7 @@ from nats.client.errors import (
     MaxPayloadError,
     MaxPayloadServerError,
     NoRespondersError,
+    OutboundBufferLimitError,
     ParserViolationError,
     PermissionsViolationError,
     SecureConnectionRequiredError,
@@ -95,7 +96,12 @@ logger = logging.getLogger("nats.client")
 
 _DEFAULT_PENDING_BYTES_LIMIT: Final[int] = 1024 * 1024
 _DEFAULT_PENDING_MESSAGES_LIMIT: Final[int] = 512
+# Hard per-connection cap on buffered, not-yet-flushed publish commands.
+# Once this many messages are queued (e.g. while the connection is down or
+# the peer cannot keep up), further publishes fail explicitly instead of
+# being silently dropped.
 _DEFAULT_MIN_FLUSH_INTERVAL: Final[float] = 0.005
+MAX_OUTBOUND_PENDING_MESSAGES: Final[int] = 5000
 
 
 NkeyPublicKeyHandler: TypeAlias = Callable[[], str]
@@ -375,6 +381,14 @@ class ClientStatistics:
     reconnects: int = 0
     """Number of successful reconnection attempts."""
 
+    dropped_out_messages: int = 0
+    """Number of outgoing messages rejected because the outbound pending queue was full.
+
+    Each rejected publish raises :class:`OutboundBufferLimitError` to the caller
+    and is counted here, so the total number of messages that never entered the
+    send pipeline remains observable after the fact.
+    """
+
 
 _SUBJECT_INVALID_RE = re.compile(r"[ \t\r\n]")
 
@@ -468,6 +482,7 @@ class Client(AbstractAsyncContextManager["Client"]):
     _pending_messages: list[bytes]
     _max_pending_bytes: int
     _max_pending_messages: int
+    _max_outbound_pending_messages: int
     _min_flush_interval: float
     _last_flush: float
     _flush_waker: asyncio.Event
@@ -520,6 +535,7 @@ class Client(AbstractAsyncContextManager["Client"]):
     _stats_in_bytes: int
     _stats_out_bytes: int
     _stats_reconnects: int
+    _stats_dropped_out_messages: int
 
     # Tasks
     _read_task: asyncio.Task[None]
@@ -559,6 +575,7 @@ class Client(AbstractAsyncContextManager["Client"]):
         verbose: bool = False,
         pedantic: bool = False,
         skip_subject_validation: bool = False,
+        max_outbound_pending_messages: int = MAX_OUTBOUND_PENDING_MESSAGES,
     ):
         """Initialize the client.
 
@@ -595,6 +612,9 @@ class Client(AbstractAsyncContextManager["Client"]):
             verbose: If True, the server will reply +OK on each protocol message (default: False)
             pedantic: If True, the server enforces strict protocol checks (default: False)
             skip_subject_validation: If True, skip client-side subject and queue validation
+            max_outbound_pending_messages: Hard per-connection cap on buffered, not-yet-flushed
+                publish commands. Publishes beyond this cap raise OutboundBufferLimitError instead
+                of being silently dropped (default: 5000).
         """
         self._connection = connection
         self._server_info = server_info
@@ -661,6 +681,10 @@ class Client(AbstractAsyncContextManager["Client"]):
         self._pending_messages = []
         self._max_pending_bytes = _DEFAULT_PENDING_BYTES_LIMIT
         self._max_pending_messages = _DEFAULT_PENDING_MESSAGES_LIMIT
+        if max_outbound_pending_messages <= 0:
+            msg = "max_outbound_pending_messages must be a positive integer"
+            raise ValueError(msg)
+        self._max_outbound_pending_messages = max_outbound_pending_messages
         self._min_flush_interval = _DEFAULT_MIN_FLUSH_INTERVAL
         loop = asyncio.get_running_loop()
         self._last_flush = loop.time() - self._min_flush_interval
@@ -680,6 +704,7 @@ class Client(AbstractAsyncContextManager["Client"]):
         self._stats_in_bytes = 0
         self._stats_out_bytes = 0
         self._stats_reconnects = 0
+        self._stats_dropped_out_messages = 0
         self._read_task = asyncio.create_task(self._read_loop())
         self._write_task = asyncio.create_task(self._write_loop())
 
@@ -698,6 +723,11 @@ class Client(AbstractAsyncContextManager["Client"]):
         """Get the last protocol error received from the server."""
         return self._last_error
 
+    @property
+    def max_outbound_pending_messages(self) -> int:
+        """Hard cap on buffered, not-yet-flushed publish commands for this connection."""
+        return self._max_outbound_pending_messages
+
     def stats(self) -> ClientStatistics:
         """Return a snapshot of the current connection statistics.
 
@@ -715,6 +745,7 @@ class Client(AbstractAsyncContextManager["Client"]):
             in_bytes=self._stats_in_bytes,
             out_bytes=self._stats_out_bytes,
             reconnects=self._stats_reconnects,
+            dropped_out_messages=self._stats_dropped_out_messages,
         )
 
     async def _read_loop(self) -> None:
@@ -1459,6 +1490,8 @@ class Client(AbstractAsyncContextManager["Client"]):
         Raises:
             RuntimeError: Connection is closed.
             MaxPayloadError: The payload is larger than the server's ``max_payload``.
+            OutboundBufferLimitError: The per-connection outbound pending queue already
+                holds its maximum number of messages.
         """
         if self._status in (ClientStatus.CLOSED, ClientStatus.CLOSING):
             msg = "Connection is closed"
@@ -1505,6 +1538,20 @@ class Client(AbstractAsyncContextManager["Client"]):
                 reply=reply,
             )
         message_size = len(message_data)
+
+        # Hard per-connection bound on the local send queue. The soft limits
+        # below trigger a flush so a healthy connection never reaches this
+        # point; it is normally hit while disconnected (reconnect buffering)
+        # or when the peer cannot keep up. Reject explicitly and count the
+        # drop instead of accepting a message that would never be sent.
+        if len(self._pending_messages) >= self._max_outbound_pending_messages:
+            self._stats_dropped_out_messages += 1
+            logger.error(
+                "Outbound pending queue full (%d messages), dropping publish to subject %s",
+                self._max_outbound_pending_messages,
+                subject,
+            )
+            raise OutboundBufferLimitError(self._max_outbound_pending_messages)
 
         if (
             self._pending_bytes + message_size > self._max_pending_bytes
@@ -2077,6 +2124,7 @@ async def connect(
     verbose: bool = False,
     pedantic: bool = False,
     skip_subject_validation: bool = False,
+    max_outbound_pending_messages: int = MAX_OUTBOUND_PENDING_MESSAGES,
 ) -> Client:
     """Connect to a NATS server.
 
@@ -2133,6 +2181,11 @@ async def connect(
             on publish, subscribe, and request. Mirrors nats.go's ``SkipSubjectValidation``.
             WARNING: this disables CRLF-injection protection — only enable for hot-path
             benchmarks where you fully control the subject inputs.
+        max_outbound_pending_messages: Hard per-connection cap on the number of publish
+            commands buffered locally before they are flushed to the server. When the
+            queue is full, ``publish()`` raises ``OutboundBufferLimitError`` and counts
+            the rejected message in ``stats().dropped_out_messages`` instead of silently
+            dropping it (default: 5000).
 
     Returns:
         Client instance
@@ -2349,6 +2402,7 @@ async def connect(
                     verbose=verbose,
                     pedantic=pedantic,
                     skip_subject_validation=skip_subject_validation,
+                    max_outbound_pending_messages=max_outbound_pending_messages,
                 )
 
                 if handshake_errors:
@@ -2401,6 +2455,8 @@ __all__ = [
     "StatusError",
     "NoRespondersError",
     "MaxPayloadError",
+    "OutboundBufferLimitError",
+    "MAX_OUTBOUND_PENDING_MESSAGES",
     "SecureConnectionRequiredError",
     "ServerError",
     "AuthorizationViolationError",

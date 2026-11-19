@@ -8,6 +8,7 @@ __all__ = [
     "AuthorizationViolationError",
     "InvalidSubjectError",
     "MaxConnectionsExceededError",
+    "OutboundBufferLimitError",
     "MaxPayloadError",
     "MaxPayloadServerError",
     "NoRespondersError",
@@ -37,6 +38,24 @@ class MaxPayloadError(ValueError):
         self.size = size
         self.max_payload = max_payload
         super().__init__(f"payload of {size} bytes exceeds server max_payload of {max_payload} bytes")
+
+
+class OutboundBufferLimitError(ConnectionError):
+    """Raised when the per-connection outbound pending queue is full.
+
+    Publish commands are buffered locally in a bounded pending queue before the
+    background write task flushes them to the server. When the queue already
+    holds its maximum number of messages, :meth:`Client.publish` raises this
+    error instead of silently discarding the message, so callers always know
+    that a publish was not accepted. Each rejected publish also increments the
+    ``dropped_out_messages`` counter exposed via :meth:`Client.stats`.
+    """
+
+    limit: int
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        super().__init__(f"outbound pending queue is full: limit of {limit} messages reached")
 
 
 def quote_server_text(value: str | bytes) -> str:

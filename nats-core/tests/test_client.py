@@ -11,11 +11,13 @@ import nkeys
 import pytest
 from nacl.signing import SigningKey
 from nats.client import (
+    MAX_OUTBOUND_PENDING_MESSAGES,
     AuthorizationViolationError,
     ClientStatistics,
     ClientStatus,
     MaxPayloadError,
     NoRespondersError,
+    OutboundBufferLimitError,
     SlowConsumerError,
     _redact_url,
     connect,
@@ -1230,6 +1232,187 @@ async def test_flush_ensures_message_delivery(client):
             break
 
     assert received_count == message_count
+
+
+async def _wait_for_status(client, status, timeout=2.0):
+    """Poll until the client reaches ``status`` or time out."""
+
+    async def _poll():
+        while client.status != status:
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(_poll(), timeout=timeout)
+
+
+@pytest.mark.asyncio
+async def test_publish_outbound_queue_full_raises_and_counts(server):
+    """A full outbound pending queue must surface to the caller instead of silent drops.
+
+    While the connection is down, publish commands accumulate in the local
+    pending queue. Once it holds its cap, further publishes raise
+    OutboundBufferLimitError and each rejection is counted in stats.
+    """
+    client = await connect(
+        server.client_url,
+        timeout=1.0,
+        reconnect_time_wait=0.1,
+        max_outbound_pending_messages=100,
+    )
+    try:
+        assert client.max_outbound_pending_messages == 100
+
+        await server.shutdown()
+        await _wait_for_status(client, ClientStatus.RECONNECTING)
+
+        test_subject = f"test.outbound.full.{uuid.uuid4()}"
+        accepted = 0
+        rejected = 0
+        for i in range(150):
+            try:
+                await client.publish(test_subject, f"{i}".encode())
+                accepted += 1
+            except OutboundBufferLimitError as error:
+                rejected += 1
+                assert error.limit == 100
+
+        assert accepted == 100
+        assert rejected == 50
+        assert len(client._pending_messages) == 100
+        assert client.stats().dropped_out_messages == 50
+        # Rejected publishes must not be counted as accepted outbound messages.
+        assert client.stats().out_messages == 100
+
+        # The queue stays bounded: repeated attempts keep raising rather than growing memory.
+        with pytest.raises(OutboundBufferLimitError):
+            await client.publish(test_subject, b"one more")
+        assert len(client._pending_messages) == 100
+        assert client.stats().dropped_out_messages == 51
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_publish_outbound_queue_default_cap_is_5000(server):
+    """The default per-connection outbound cap is 5000 messages."""
+    assert MAX_OUTBOUND_PENDING_MESSAGES == 5000
+    client = await connect(server.client_url, timeout=1.0, reconnect_time_wait=0.1)
+    try:
+        assert client.max_outbound_pending_messages == 5000
+
+        await server.shutdown()
+        await _wait_for_status(client, ClientStatus.RECONNECTING)
+
+        test_subject = f"test.outbound.cap5000.{uuid.uuid4()}"
+        accepted = 0
+        rejected = 0
+        for i in range(5050):
+            try:
+                await client.publish(test_subject, f"{i}".encode())
+                accepted += 1
+            except OutboundBufferLimitError:
+                rejected += 1
+
+        assert accepted == 5000
+        assert rejected == 50
+        assert len(client._pending_messages) == 5000
+        assert client.stats().dropped_out_messages == 50
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_publish_outbound_queue_full_compared_with_actual_delivery(server):
+    """Fill the queue while disconnected, then compare attempted vs delivered counts.
+
+    Messages accepted before the cap must all be delivered after reconnect;
+    rejected messages never reach the server.
+    """
+    port = server.port
+    url = server.client_url
+    test_subject = f"test.outbound.delivery.{uuid.uuid4()}"
+    publisher = await connect(
+        url,
+        timeout=1.0,
+        reconnect_time_wait=0.1,
+        max_outbound_pending_messages=100,
+    )
+    try:
+        await server.shutdown()
+        await _wait_for_status(publisher, ClientStatus.RECONNECTING)
+
+        attempted = 130
+        accepted = 0
+        rejected = 0
+        for i in range(attempted):
+            try:
+                await publisher.publish(test_subject, f"msg-{i}".encode())
+                accepted += 1
+            except OutboundBufferLimitError:
+                rejected += 1
+        assert accepted == 100
+        assert rejected == 30
+
+        # Bring the server back and attach a fresh subscriber before replay.
+        new_server = await run(port=port, timeout=5.0)
+        try:
+            subscriber = await connect(url, timeout=1.0)
+            try:
+                subscription = await subscriber.subscribe(test_subject)
+                await subscriber.flush()
+
+                await _wait_for_status(publisher, ClientStatus.CONNECTED)
+                await publisher.flush()
+
+                delivered = 0
+                while True:
+                    try:
+                        await subscription.next(timeout=1.0)
+                        delivered += 1
+                    except TimeoutError:
+                        break
+
+                assert delivered == accepted == 100
+                assert attempted == delivered + rejected
+                assert publisher.stats().dropped_out_messages == 30
+            finally:
+                await subscriber.close()
+        finally:
+            await new_server.shutdown()
+    finally:
+        await publisher.close()
+
+
+@pytest.mark.asyncio
+async def test_publish_outbound_cap_does_not_add_latency_when_healthy(client):
+    """On a healthy connection the hard cap is never hit: batching flushes keep the queue small."""
+    test_subject = f"test.outbound.healthy.{uuid.uuid4()}"
+    subscription = await client.subscribe(test_subject)
+    await client.flush()
+
+    for i in range(2000):
+        await client.publish(test_subject, f"{i}".encode())
+        # The soft flush threshold (512) keeps the pending queue far below the
+        # 5000-message hard cap on a working connection.
+        assert len(client._pending_messages) <= client._max_pending_messages
+
+    await client.flush()
+    assert client.stats().dropped_out_messages == 0
+
+    received = 0
+    while True:
+        try:
+            await subscription.next(timeout=1.0)
+            received += 1
+        except TimeoutError:
+            break
+    assert received == 2000
+
+
+@pytest.mark.asyncio
+async def test_connect_rejects_non_positive_outbound_cap(server):
+    """The outbound cap must be a positive integer."""
+    with pytest.raises(ValueError, match="max_outbound_pending_messages"):
+        await connect(server.client_url, timeout=1.0, max_outbound_pending_messages=0)
 
 
 @pytest.mark.asyncio
