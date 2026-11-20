@@ -1219,3 +1219,111 @@ async def test_consumer_reset_below_start_seq_rejected(jetstream: JetStream):
 
     with pytest.raises(ConsumerInvalidResetError):
         await stream.reset_consumer("pinned", seq=1)
+
+
+@pytest.mark.asyncio
+async def test_fetch_timeout_reclaims_inbox_without_iteration(jetstream: JetStream):
+    """A fetch that times out and is never iterated must reap its inbox subscription.
+
+    Regression: each fetch creates an ephemeral inbox subscription. Previously
+    only iterating the returned batch to completion sent the UNSUB, so a caller
+    that awaited ``fetch`` and dropped the batch left the subscription on the
+    server for the lifetime of the connection. A burst of timed-out fetches
+    accumulated thousands of dead subscriptions.
+    """
+    stream = await jetstream.create_stream(name="test_fetch_reap", subjects=["REAP.*"])
+    consumer = await stream.create_consumer(
+        name="reap_consumer", durable_name="reap_consumer", filter_subject="REAP.*", deliver_policy="all"
+    )
+
+    client = jetstream.client
+    baseline = len(client._subscriptions)
+
+    batch_count = 25
+    for _ in range(batch_count):
+        # Deliberately do not iterate: this models a caller that gives up.
+        await consumer.fetch(max_messages=1, max_wait=0.1)
+
+    # Subscriptions exist while the fetch deadline has not elapsed.
+    assert len(client._subscriptions) >= baseline + batch_count
+
+    # The deadline-driven finalizer reclaims every abandoned inbox.
+    await asyncio.sleep(0.4)
+    assert len(client._subscriptions) == baseline
+
+
+@pytest.mark.asyncio
+async def test_fetch_nowait_reclaims_inbox_without_iteration(jetstream: JetStream):
+    """An un-iterated no-wait fetch is reaped after the grace period."""
+    stream = await jetstream.create_stream(name="test_nowait_reap", subjects=["NREAP.*"])
+    consumer = await stream.create_consumer(
+        name="nowait_reap_consumer",
+        durable_name="nowait_reap_consumer",
+        filter_subject="NREAP.*",
+        deliver_policy="all",
+    )
+
+    client = jetstream.client
+    baseline = len(client._subscriptions)
+
+    for _ in range(10):
+        await consumer.fetch_nowait(max_messages=1)
+
+    await asyncio.sleep(1.0)
+    assert len(client._subscriptions) == baseline
+
+
+@pytest.mark.asyncio
+async def test_reaped_inbox_does_not_deliver_late_response(jetstream: JetStream):
+    """A response arriving after the inbox is reaped must not surface anywhere.
+
+    The server stops routing once the UNSUB lands, and the client additionally
+    dispatches by subscription id, so a late reply can never be mistaken for a
+    new request's response. A subsequent fetch on the same consumer still works.
+    """
+    stream = await jetstream.create_stream(name="test_late_reply", subjects=["LATE.*"])
+    consumer = await stream.create_consumer(
+        name="late_consumer", durable_name="late_consumer", filter_subject="LATE.*", deliver_policy="all"
+    )
+
+    client = jetstream.client
+    baseline = len(client._subscriptions)
+
+    abandoned = await consumer.fetch(max_messages=1, max_wait=0.1)
+    # Let the deadline pass and the finalizer tear the inbox down.
+    await asyncio.sleep(0.3)
+    assert abandoned._terminated is True
+    assert len(client._subscriptions) == baseline
+
+    # A message published after the timeout would have matched the old inbox
+    # request; it stays in the stream instead of being delivered to a dead sub.
+    await jetstream.publish("LATE.1", b"late")
+
+    # The next fetch must return the stored message via a fresh inbox.
+    batch = await consumer.fetch(max_messages=1, max_wait=2.0)
+    messages = []
+    async for msg in batch:
+        messages.append(msg)
+        await msg.ack()
+
+    assert len(messages) == 1
+    assert messages[0].data == b"late"
+    assert len(client._subscriptions) == baseline
+
+
+@pytest.mark.asyncio
+async def test_fetch_batch_context_manager_reclaims_inbox(jetstream: JetStream):
+    """Explicitly closing a batch as a context manager reaps the inbox early."""
+    stream = await jetstream.create_stream(name="test_batch_cm", subjects=["BCM.*"])
+    consumer = await stream.create_consumer(
+        name="batch_cm_consumer", durable_name="batch_cm_consumer", filter_subject="BCM.*", deliver_policy="all"
+    )
+
+    client = jetstream.client
+    baseline = len(client._subscriptions)
+
+    async with await consumer.fetch(max_messages=1, max_wait=5.0) as batch:
+        assert len(client._subscriptions) >= baseline + 1
+
+    assert batch._terminated is True
+    assert len(client._subscriptions) == baseline

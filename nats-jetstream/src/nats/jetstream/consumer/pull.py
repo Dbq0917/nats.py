@@ -36,6 +36,12 @@ logger = logging.getLogger(__name__)
 # miss can be a lost batch; a second means nothing is answering.
 _MAX_MISSED_HEARTBEATS = 2
 
+# Grace period before an un-iterated no-wait batch's inbox is reaped. The
+# server answers a no-wait request immediately (messages or a 404), so a
+# caller that iterates right away always finishes first; the grace only covers
+# scheduling jitter, then reclaims a batch that was abandoned.
+_NOWAIT_REAP_GRACE = 0.5
+
 
 def _message_size(msg: ClientMessage) -> int:
     """Calculate the size of a message per ADR-37.
@@ -64,6 +70,8 @@ class PullMessageBatch(MessageBatch):
     _heartbeat_deadline: float | None
     _heartbeat_paused: bool
     _heartbeat_remaining: float | None
+    _finalizer_task: asyncio.Task[None] | None
+    _cleanup_callbacks: list[Any] | None
 
     def __init__(
         self,
@@ -72,6 +80,7 @@ class PullMessageBatch(MessageBatch):
         jetstream,
         max_wait: float | None,
         heartbeat: float | None = None,
+        reap_after: float | None = None,
     ):
         self._subscription = subscription
         self._pending_messages = batch_size
@@ -83,12 +92,26 @@ class PullMessageBatch(MessageBatch):
         self._heartbeat_deadline = time.time() + (heartbeat * 2) if heartbeat is not None else None
         self._heartbeat_paused = False
         self._heartbeat_remaining = None
+        self._finalizer_task = None
+        self._cleanup_callbacks = None
 
         # Register disconnect/reconnect callbacks for heartbeat timer (ADR-37)
         if heartbeat is not None:
             client = jetstream._client
             client.add_disconnected_callback(self._pause_heartbeat_timer)
             client.add_reconnected_callback(self._resume_heartbeat_timer)
+            self._cleanup_callbacks = [self._pause_heartbeat_timer, self._resume_heartbeat_timer]
+
+        # Each fetch owns an ephemeral inbox subscription. A batch that is
+        # never iterated (or whose caller gives up before the deadline) would
+        # otherwise leave that subscription registered on the server forever:
+        # the inbox is a unique subject, so nothing else can trigger its
+        # teardown. Arm a deadline-driven finalizer so the subscription is
+        # reclaimed automatically. It only sleeps locally and sends the same
+        # UNSUB that normal iteration completion sends, so no extra protocol
+        # round trip is added per request.
+        if reap_after is not None:
+            self._finalizer_task = asyncio.create_task(self._run_finalizer(reap_after))
 
     def _pause_heartbeat_timer(self) -> None:
         """Pause the heartbeat timer on disconnect (ADR-37)."""
@@ -103,6 +126,61 @@ class PullMessageBatch(MessageBatch):
             self._heartbeat_paused = False
             self._heartbeat_remaining = None
 
+    async def _run_finalizer(self, reap_after: float) -> None:
+        """Unsubscribe the ephemeral inbox once the fetch deadline passes.
+
+        ``reap_after`` matches the wall-clock deadline ``__anext__`` enforces
+        for expiry-based fetches, or is a short grace period for no-wait
+        fetches. Either way a reaped batch behaves like one whose iteration
+        finished. If the connection is down when the deadline passes, the
+        UNSUB is buffered and replayed on reconnect, matching every other
+        subscription in the client.
+        """
+        try:
+            await asyncio.sleep(reap_after)
+            if not self._terminated:
+                await self._cleanup()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Error while reaping fetch inbox subscription")
+
+    async def _cleanup(self) -> None:
+        """Tear down the inbox subscription exactly once and drop timers."""
+        if self._terminated:
+            return
+        self._terminated = True
+
+        if self._finalizer_task is not None:
+            self._finalizer_task.cancel()
+            try:
+                await self._finalizer_task
+            except asyncio.CancelledError:
+                pass
+            self._finalizer_task = None
+
+        if self._cleanup_callbacks is not None:
+            client = self._jetstream._client
+            for callback in self._cleanup_callbacks:
+                with contextlib.suppress(Exception):
+                    client.remove_disconnected_callback(callback)
+                    client.remove_reconnected_callback(callback)
+            self._cleanup_callbacks = None
+
+        with contextlib.suppress(Exception):
+            await self._subscription.unsubscribe()
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        await self._cleanup()
+
     @property
     def error(self) -> Exception | None:
         return self._error
@@ -113,8 +191,7 @@ class PullMessageBatch(MessageBatch):
     async def __anext__(self) -> Message:
         if self._terminated or self._pending_messages <= 0:
             if not self._terminated:
-                await self._subscription.unsubscribe()
-                self._terminated = True
+                await self._cleanup()
             raise StopAsyncIteration
 
         try:
@@ -210,9 +287,7 @@ class PullMessageBatch(MessageBatch):
                 self._pending_messages -= 1
                 return js_msg
         except (StopAsyncIteration, asyncio.TimeoutError):
-            if not self._terminated:
-                await self._subscription.unsubscribe()
-                self._terminated = True
+            await self._cleanup()
             raise StopAsyncIteration
 
 
@@ -882,6 +957,14 @@ class PullConsumer(Consumer):
 
         await jetstream.client.publish(subject, payload=payload, reply=inbox)
 
+        # Expiry-based fetches are reaped when their own deadline passes;
+        # no-wait fetches have no deadline, so use a short grace period.
+        reap_after = _NOWAIT_REAP_GRACE if no_wait else max_wait
         return PullMessageBatch(
-            subscription=subscription, batch_size=batch, jetstream=jetstream, max_wait=max_wait, heartbeat=heartbeat
+            subscription=subscription,
+            batch_size=batch,
+            jetstream=jetstream,
+            max_wait=max_wait,
+            heartbeat=heartbeat,
+            reap_after=reap_after,
         )
