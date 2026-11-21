@@ -49,6 +49,22 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
+## Adaptive worker pools
+
+Several workers can share one durable pull consumer to load-balance a queue.
+`messages()` sizes each worker's in-flight window from its observed handler
+pace: a fast worker ramps up to `max_messages`, while a worker processing a
+slow report job stays at one message instead of reserving a full batch. The
+window only changes future pull requests; messages already delivered are never
+moved or re-requested.
+
+```python
+messages = await consumer.messages(max_messages=100, target_latency=0.1)
+async for message in messages:
+    await generate_report(message.data)  # Slow workers automatically take less work.
+    await message.ack()
+```
+
 ## License
 
 MIT

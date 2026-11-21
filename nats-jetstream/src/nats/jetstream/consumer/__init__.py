@@ -525,6 +525,8 @@ class Consumer(Protocol):
         max_messages: int,
         max_wait: float | None = None,
         heartbeat: float | None = None,
+        adaptive: bool = True,
+        target_latency: float = 0.1,
     ) -> MessageBatch: ...
 
     @overload
@@ -534,6 +536,8 @@ class Consumer(Protocol):
         max_bytes: int,
         max_wait: float | None = None,
         heartbeat: float | None = None,
+        adaptive: bool = True,
+        target_latency: float = 0.1,
     ) -> MessageBatch: ...
 
     @overload
@@ -561,6 +565,9 @@ class Consumer(Protocol):
         max_wait: float | None = None,
         max_messages: int | None = None,
         max_bytes: int | None = None,
+        adaptive: bool = True,
+        target_latency: float = 0.1,
+        initial_window: int = 1,
     ) -> MessageStream:
         """Get a message stream for continuous message consumption."""
         ...

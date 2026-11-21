@@ -1113,6 +1113,104 @@ async def test_messages_end_after_repeated_missed_heartbeats(jetstream: JetStrea
 
 
 @pytest.mark.asyncio
+async def test_adaptive_workers_give_slow_consumer_fewer_messages(jetstream: JetStream):
+    """A slow report worker must not hold an equal share of a shared consumer.
+
+    All three workers use the same durable pull consumer, so they are the pull
+    equivalent of one queue group. Adaptive prefetch starts each worker at a
+    one-message window and grows it only as the worker proves it consumes
+    quickly. The report worker stays at one message instead of reserving a
+    full batch that the fast workers could have finished.
+    """
+    stream = await jetstream.create_stream(name="test_adaptive_workers", subjects=["REPORT.*"])
+    await stream.create_consumer(
+        name="report_workers",
+        durable_name="report_workers",
+        filter_subject="REPORT.*",
+        ack_policy="explicit",
+    )
+    workers = [await stream.get_consumer("report_workers") for _ in range(3)]
+
+    message_count = 60
+    for i in range(message_count):
+        await jetstream.publish("REPORT.task", f"report-{i}".encode())
+
+    counts = [0, 0, 0]
+    seen: set[bytes] = set()
+    finished = asyncio.Event()
+
+    async def work(worker: int, delay: float) -> None:
+        messages = await workers[worker].messages(max_messages=10, max_wait=2.0)
+        try:
+            async for msg in messages:
+                # The report worker models a job that takes seconds. Keep the
+                # test quick while still being far slower than the others.
+                await asyncio.sleep(delay)
+                await msg.ack()
+                counts[worker] += 1
+                seen.add(msg.data)
+                if sum(counts) == message_count:
+                    finished.set()
+                    break
+        finally:
+            await messages.stop()
+
+    tasks = [
+        asyncio.create_task(work(0, 0.5)),
+        asyncio.create_task(work(1, 0.0)),
+        asyncio.create_task(work(2, 0.0)),
+    ]
+
+    try:
+        await asyncio.wait_for(finished.wait(), timeout=10.0)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Every task ran exactly once: no message was moved between workers and
+    # nothing was delivered twice or left behind.
+    assert sum(counts) == message_count
+    assert len(seen) == message_count
+
+    # The slow worker is kept to a small window; the two normal workers take
+    # the rest of the work instead of waiting behind a reserved batch.
+    assert counts[0] <= 2
+    assert counts[1] >= 10
+    assert counts[2] >= 10
+
+
+@pytest.mark.asyncio
+async def test_messages_refills_with_batch_one(jetstream: JetStream):
+    """A one-message adaptive window still refills as soon as work is requested."""
+    stream = await jetstream.create_stream(name="test_batch_one", subjects=["ONE.*"])
+    consumer = await stream.create_consumer(
+        name="one_consumer",
+        durable_name="one_consumer",
+        filter_subject="ONE.*",
+        ack_policy="explicit",
+    )
+
+    for i in range(3):
+        await jetstream.publish("ONE.task", f"one-{i}".encode())
+
+    messages = await consumer.messages(max_messages=1)
+    received = []
+    try:
+        async with asyncio.timeout(5.0):
+            async for msg in messages:
+                received.append(msg.data)
+                await msg.ack()
+                if len(received) == 3:
+                    break
+    finally:
+        await messages.stop()
+
+    assert received == [b"one-0", b"one-1", b"one-2"]
+
+
+@pytest.mark.asyncio
 async def test_consumer_reset_to_seq(jetstream: JetStream):
     """Reset a consumer forward to a specific stream sequence (ADR-60).
 

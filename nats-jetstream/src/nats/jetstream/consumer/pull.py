@@ -13,6 +13,7 @@ from typing import (
     Self,
     overload,
 )
+from weakref import WeakKeyDictionary
 
 from nats.jetstream.consumer import (
     Consumer,
@@ -36,6 +37,57 @@ logger = logging.getLogger(__name__)
 # miss can be a lost batch; a second means nothing is answering.
 _MAX_MISSED_HEARTBEATS = 2
 
+# How much queueing delay a worker is allowed to build up in front of its
+# handler. The in-flight window is derived from the observed handler pace:
+# fast workers get a full batch, slow workers are reduced to one message.
+_DEFAULT_TARGET_LATENCY = 0.1
+
+
+class _AdaptivePrefetch:
+    """Translate observed handler latency into a pull request window."""
+
+    __slots__ = ("max_window", "target_latency", "window")
+
+    def __init__(self, max_window: int, target_latency: float = _DEFAULT_TARGET_LATENCY, initial: int = 1):
+        self.max_window = max(1, max_window)
+        self.target_latency = max(0.0, target_latency)
+        self.window = min(self.max_window, max(1, initial))
+
+    def observe(self, elapsed: float) -> None:
+        """Adjust the window using the time a worker took to ask for more work.
+
+        A worker asks for its next message after its handler has finished, so
+        this interval approximates handler service time (plus one round trip).
+        Messages already delivered are never moved or re-requested; only the
+        size of future pull requests changes.
+        """
+        if elapsed < 0 or self.target_latency <= 0:
+            return
+
+        if elapsed >= self.target_latency * 4:
+            self.window = 1
+        elif elapsed > self.target_latency * 2:
+            self.window = max(1, self.window // 2)
+        elif elapsed < self.target_latency:
+            self.window = min(self.max_window, max(self.window + 1, self.window * 2))
+
+
+class _FetchPacer:
+    """Per-task fetch pacing state.
+
+    Workers typically loop over ``fetch()`` in one task. Keeping a pacer per
+    task means several workers can share the same consumer object without
+    mixing their service-time measurements.
+    """
+
+    __slots__ = ("adaptive", "previous")
+
+    def __init__(self, max_window: int, target_latency: float):
+        # The first fetch keeps the caller's requested size; later fetches are
+        # reduced only after this task has demonstrated slow processing.
+        self.adaptive = _AdaptivePrefetch(max_window, target_latency=target_latency, initial=max_window)
+        self.previous: Any = None
+
 
 def _message_size(msg: ClientMessage) -> int:
     """Calculate the size of a message per ADR-37.
@@ -55,6 +107,9 @@ def _message_size(msg: ClientMessage) -> int:
 
 class PullMessageBatch(MessageBatch):
     _subscription: Subscription
+    _batch_size: int
+    _delivered: int
+    _last_delivery_at: float | None
     _pending_messages: int
     _jetstream: Any
     _terminated: bool
@@ -74,6 +129,9 @@ class PullMessageBatch(MessageBatch):
         heartbeat: float | None = None,
     ):
         self._subscription = subscription
+        self._batch_size = batch_size
+        self._delivered = 0
+        self._last_delivery_at = None
         self._pending_messages = batch_size
         self._jetstream = jetstream
         self._terminated = False
@@ -208,6 +266,8 @@ class PullMessageBatch(MessageBatch):
                 )
 
                 self._pending_messages -= 1
+                self._delivered += 1
+                self._last_delivery_at = time.monotonic()
                 return js_msg
         except (StopAsyncIteration, asyncio.TimeoutError):
             if not self._terminated:
@@ -232,6 +292,12 @@ class PullMessageStream(MessageStream):
     _terminated: bool
     _pending_messages: int
     _pending_bytes: int
+    _adaptive: _AdaptivePrefetch | None
+    _threshold_messages_explicit: bool
+    _refill: asyncio.Event
+    _last_delivery_at: float | None
+    _sample_service: bool
+    _had_backlog: bool
     _request_task: asyncio.Task[None] | None
     _heartbeat_task: asyncio.Task[None] | None
     _started: bool
@@ -254,6 +320,9 @@ class PullMessageStream(MessageStream):
         priority: int | None = None,
         threshold_messages: int | None = None,
         threshold_bytes: int | None = None,
+        adaptive: bool = True,
+        target_latency: float = _DEFAULT_TARGET_LATENCY,
+        initial_window: int = 1,
     ):
         self._consumer = consumer
         self._subscription = subscription
@@ -268,12 +337,25 @@ class PullMessageStream(MessageStream):
         self._heartbeat_paused = False
         self._heartbeat_remaining = None
         # Set thresholds with defaults to 50% if not specified
+        self._threshold_messages_explicit = threshold_messages is not None
         self._threshold_messages = threshold_messages if threshold_messages is not None else batch // 2
         self._threshold_bytes = (
             threshold_bytes
             if threshold_bytes is not None and max_bytes is not None
             else (max_bytes // 2 if max_bytes is not None else None)
         )
+        # A byte-based stream already requests a very large batch and relies on
+        # max_bytes, so keep its existing behaviour and adapt only count-based
+        # streams.
+        self._adaptive = (
+            _AdaptivePrefetch(batch, target_latency=target_latency, initial=initial_window)
+            if adaptive and max_bytes is None and priority_group is None
+            else None
+        )
+        self._refill = asyncio.Event()
+        self._last_delivery_at = None
+        self._sample_service = False
+        self._had_backlog = False
         self._terminated = False
         self._pending_messages = 0
         self._pending_bytes = 0
@@ -307,12 +389,55 @@ class PullMessageStream(MessageStream):
         """Check if the message stream is still active."""
         return not self._terminated
 
+    def _window(self) -> int:
+        """Number of messages to keep in flight for this worker."""
+        return self._adaptive.window if self._adaptive is not None else self._batch
+
+    def _message_threshold(self) -> int:
+        """Refill threshold bounded by the current adaptive window."""
+        window = self._window()
+        if self._threshold_messages_explicit:
+            return max(1, min(self._threshold_messages, window))
+        if window <= 1:
+            # With a one-message window, wait until the handler asks for its
+            # next message instead of prefetching one ahead.
+            return 0
+        return max(1, window // 2)
+
+    def _needs_refill(self) -> bool:
+        """Whether another pull request should be in flight."""
+        threshold = self._message_threshold()
+        if threshold <= 0:
+            return self._pending_messages <= 0
+        return self._pending_messages < threshold
+
+    def _observe_service_time(self) -> None:
+        """Feed the previous handler interval into the adaptive window."""
+        if not self._sample_service:
+            return
+        self._sample_service = False
+
+        if self._adaptive is None or self._last_delivery_at is None:
+            return
+        elapsed = time.monotonic() - self._last_delivery_at
+
+        # An empty local queue means the next wait may simply have been idle
+        # time, not handler work. In that case only a clearly fast turnaround
+        # is safe to treat as evidence that the worker can handle more; a long
+        # interval could just mean there was nothing to do.
+        if self._had_backlog or elapsed < self._adaptive.target_latency:
+            self._adaptive.observe(elapsed)
+
     def __aiter__(self) -> AsyncIterator[Message]:
         return self
 
     async def __anext__(self) -> Message:
         if self._terminated:
             raise StopAsyncIteration
+
+        self._observe_service_time()
+        if self._started and self._pending_messages == 0:
+            self._refill.set()
 
         # Start the request loop task on first access
         if not self._started:
@@ -382,13 +507,21 @@ class PullMessageStream(MessageStream):
             self._pending_bytes = max(0, self._pending_bytes - _message_size(raw_msg))
 
             # Convert to JetStream message
-            return Message(
+            msg = Message(
                 data=raw_msg.data,
                 subject=raw_msg.subject,
                 reply=raw_msg.reply,
                 headers=raw_msg.headers,
                 jetstream=self._consumer._stream._jetstream,
             )
+            self._last_delivery_at = time.monotonic()
+            self._had_backlog = self._pending_messages > 0 or msg.metadata.num_pending > 0
+            self._sample_service = True
+
+            if self._pending_messages < self._message_threshold():
+                self._refill.set()
+
+            return msg
 
     async def _send_request(self):
         """Send a pull request to the server."""
@@ -396,9 +529,10 @@ class PullMessageStream(MessageStream):
             return
 
         jetstream = self._consumer._stream._jetstream
+        window = self._window()
 
         request: dict[str, Any] = {
-            "batch": self._batch,
+            "batch": window,
             "expires": int(self._expires * 1_000_000_000),
             "no_wait": False,
         }
@@ -427,7 +561,7 @@ class PullMessageStream(MessageStream):
 
         await jetstream.client.publish(subject, payload=payload, reply=self._subscription.subject)
 
-        self._pending_messages += self._batch
+        self._pending_messages += window
         if self._max_bytes is not None:
             self._pending_bytes += self._max_bytes
 
@@ -438,10 +572,10 @@ class PullMessageStream(MessageStream):
             await self._send_request()
 
             while not self._terminated:
-                await asyncio.sleep(0.1)  # Check every 100ms
-
-                # Send new request if we're running low on messages
-                should_request = self._pending_messages < self._threshold_messages
+                # Send new request if we're running low on messages. Delivery
+                # sets the event immediately; the timeout is only a fallback
+                # for byte thresholds and lost responses.
+                should_request = self._needs_refill()
 
                 # Also consider bytes if we have a limit and threshold
                 if self._threshold_bytes is not None:
@@ -449,6 +583,13 @@ class PullMessageStream(MessageStream):
 
                 if should_request:
                     await self._send_request()
+                    continue
+
+                try:
+                    await asyncio.wait_for(self._refill.wait(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    pass
+                self._refill.clear()
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -526,10 +667,36 @@ class PullMessageStream(MessageStream):
 class PullConsumer(Consumer):
     _stream: Stream
     _info: ConsumerInfo
+    _fetch_pacers: WeakKeyDictionary[asyncio.Task[Any], _FetchPacer]
 
     def __init__(self, stream: Stream, info: ConsumerInfo):
         self._stream = stream
         self._info = info
+        self._fetch_pacers = WeakKeyDictionary()
+
+    def _pacer_for_current_fetch(self, max_window: int, target_latency: float) -> _FetchPacer | None:
+        """Return this task's fetch pacer, observing the previous batch first."""
+        task = asyncio.current_task()
+        if task is None:
+            return None
+
+        pacer = self._fetch_pacers.get(task)
+        if pacer is None or pacer.adaptive.max_window != max_window:
+            pacer = _FetchPacer(max_window, target_latency)
+            self._fetch_pacers[task] = pacer
+            return pacer
+
+        previous = pacer.previous
+        if (
+            previous is not None
+            and previous._terminated
+            and previous._delivered >= previous._batch_size
+            and previous._last_delivery_at is not None
+        ):
+            # The caller comes back for another fetch after processing the
+            # previous batch, so this is the handler pace for that worker.
+            pacer.adaptive.observe(time.monotonic() - previous._last_delivery_at)
+        return pacer
 
     @property
     def name(self) -> str:
@@ -645,6 +812,9 @@ class PullConsumer(Consumer):
         priority: int | None = None,
         threshold_messages: int | None = None,
         threshold_bytes: int | None = None,
+        adaptive: bool = True,
+        target_latency: float = _DEFAULT_TARGET_LATENCY,
+        initial_window: int = 1,
     ) -> MessageStream:
         """Create a continuous message stream for manual iteration.
 
@@ -662,6 +832,15 @@ class PullConsumer(Consumer):
                               When pending messages falls below this, a new batch is requested.
             threshold_bytes: Refill threshold for bytes (default: max_bytes // 2).
                            When pending bytes falls below this, a new batch is requested.
+            adaptive: Size each worker's in-flight window from its observed handler
+                      pace (default: True). Fast workers ramp up to ``max_messages``;
+                      slow workers stay at one message. Messages already delivered
+                      are never moved or re-requested. Priority-group requests keep
+                      their explicit request size.
+            target_latency: Queueing delay, in seconds, a worker may build up before
+                      its adaptive window is reduced (default: 0.1).
+            initial_window: Starting in-flight window for adaptive consumption
+                      (default: 1). It ramps up as fast handlers ask for more work.
 
         Returns:
             MessageStream for manual message consumption
@@ -690,6 +869,9 @@ class PullConsumer(Consumer):
             priority=priority,
             threshold_messages=threshold_messages,
             threshold_bytes=threshold_bytes,
+            adaptive=adaptive,
+            target_latency=target_latency,
+            initial_window=initial_window,
         )
 
         return stream
@@ -705,6 +887,8 @@ class PullConsumer(Consumer):
         min_pending: int | None = None,
         priority_group: str | None = None,
         priority: int | None = None,
+        adaptive: bool = True,
+        target_latency: float = _DEFAULT_TARGET_LATENCY,
     ) -> MessageBatch: ...
 
     @overload
@@ -718,6 +902,8 @@ class PullConsumer(Consumer):
         min_pending: int | None = None,
         priority_group: str | None = None,
         priority: int | None = None,
+        adaptive: bool = True,
+        target_latency: float = _DEFAULT_TARGET_LATENCY,
     ) -> MessageBatch: ...
 
     async def fetch(
@@ -731,6 +917,8 @@ class PullConsumer(Consumer):
         min_pending: int | None = None,
         priority_group: str | None = None,
         priority: int | None = None,
+        adaptive: bool = True,
+        target_latency: float = _DEFAULT_TARGET_LATENCY,
     ) -> MessageBatch:
         """Fetch a batch of messages from the consumer.
 
@@ -744,6 +932,12 @@ class PullConsumer(Consumer):
             priority_group: Priority group for message fetching
             priority: Priority level (0-9, lower is higher priority). Requires priority_group
                      and consumer with PriorityPolicyPrioritized.
+            adaptive: Reduce the requested batch after this task has shown slow
+                      processing (default: True). The first fetch always uses
+                      ``max_messages``; later batches adapt to the worker's pace.
+                      Priority-group requests keep their explicit batch size.
+            target_latency: Queueing delay, in seconds, a worker may build up before
+                      its adaptive batch is reduced (default: 0.1).
 
         Returns:
             MessageBatch containing the fetched messages
@@ -767,6 +961,8 @@ class PullConsumer(Consumer):
             priority_group=priority_group,
             priority=priority,
             no_wait=False,
+            adaptive=adaptive,
+            target_latency=target_latency,
         )
 
     @overload
@@ -848,12 +1044,21 @@ class PullConsumer(Consumer):
         priority_group: str | None = None,
         priority: int | None = None,
         no_wait: bool,
+        adaptive: bool = True,
+        target_latency: float = _DEFAULT_TARGET_LATENCY,
     ) -> MessageBatch:
+        pacer = (
+            self._pacer_for_current_fetch(batch, target_latency)
+            if adaptive and max_bytes is None and priority_group is None
+            else None
+        )
+        request_batch = min(batch, pacer.adaptive.window) if pacer is not None else batch
+
         jetstream = self._stream._jetstream
         inbox = new_inbox()
         subscription = await jetstream.client.subscribe(inbox)
 
-        request: dict[str, Any] = {"batch": batch, "no_wait": no_wait}
+        request: dict[str, Any] = {"batch": request_batch, "no_wait": no_wait}
 
         if max_wait is not None:
             request["expires"] = int(max_wait * 1_000_000_000)
@@ -882,6 +1087,13 @@ class PullConsumer(Consumer):
 
         await jetstream.client.publish(subject, payload=payload, reply=inbox)
 
-        return PullMessageBatch(
-            subscription=subscription, batch_size=batch, jetstream=jetstream, max_wait=max_wait, heartbeat=heartbeat
+        result = PullMessageBatch(
+            subscription=subscription,
+            batch_size=request_batch,
+            jetstream=jetstream,
+            max_wait=max_wait,
+            heartbeat=heartbeat,
         )
+        if pacer is not None:
+            pacer.previous = result
+        return result
